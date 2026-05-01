@@ -428,6 +428,9 @@ async function uploadFile(){
 }
 
 // ========== ГОЛОСОВЫЕ ==========
+let recordingTimer = null;
+let recordingSeconds = 0;
+
 async function startRecording(){
     if(!navigator.mediaDevices){alert('Микрофон не поддерживается');return;}
     const stream=await navigator.mediaDevices.getUserMedia({audio:true});
@@ -441,11 +444,19 @@ async function startRecording(){
         document.getElementById('msg-input').placeholder='Голосовое готово. Нажмите отправить';
     };
     mediaRecorder.start();
-    document.getElementById('voice-btn').textContent=getComputedStyle(document.documentElement).getPropertyValue('--recording-text').replace(/"/g,'').replace('🎤 ','');
+    recordingSeconds = 0;
+    document.getElementById('voice-btn').textContent = '0:00';
     document.getElementById('voice-btn').style.color='#ff3b30';
+    recordingTimer = setInterval(() => {
+        recordingSeconds++;
+        const m = Math.floor(recordingSeconds/60);
+        const s = recordingSeconds%60;
+        document.getElementById('voice-btn').textContent = `${m}:${s.toString().padStart(2,'0')}`;
+    }, 1000);
 }
 function stopRecording(){
     if(mediaRecorder&&mediaRecorder.state==='recording'){mediaRecorder.stop();}
+    clearInterval(recordingTimer);
     document.getElementById('voice-btn').textContent='🎤'; document.getElementById('voice-btn').style.color='var(--accent)';
 }
 
@@ -466,7 +477,7 @@ async function saveAllSettings(){
     let customTheme=null;
     if(theme==='custom'){customTheme=JSON.stringify({bg:document.getElementById('c-bg').value,surface:document.getElementById('c-surface').value,accent:document.getElementById('c-accent').value,text:document.getElementById('c-text').value,mymsg:document.getElementById('c-mymsg').value,othermsg:document.getElementById('c-othermsg').value,msgtext:document.getElementById('c-msgtext').value,sendtext:document.getElementById('c-sendtext').value,typing:document.getElementById('c-typing').value,recording:document.getElementById('c-recording').value});}
     await fetch(`/api/update_theme/${currentUser.id}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({theme,wallpaper_url:wallpaper||'',custom_theme:customTheme})});
-    applyTheme(theme,customTheme,wallpaper); closeSettings();
+    applyTheme(theme,customTheme,wallpaper); closeSettings();document.body.focus();
 }
 function applyTheme(theme,customThemeJson,wallpaper){
     currentTheme=theme; document.body.className=''; if(theme==='light')document.body.classList.add('theme-light');
