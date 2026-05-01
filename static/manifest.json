@@ -1,0 +1,9 @@
+{
+  "name": "Наш Мессенджер",
+  "short_name": "Мессенджер",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f0f0f",
+  "theme_color": "#2b5278",
+  "icons": []
+}
