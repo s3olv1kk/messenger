@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -8,9 +8,14 @@ import datetime
 import asyncio
 import os
 import uuid
+import httpx
 from typing import Dict, List, Optional
 
 app = FastAPI()
+
+# ===== НАСТРОЙКИ TELEGRAM =====
+TELEGRAM_BOT_TOKEN = "8650988930:AAHk5gbchTiE5_zhgR0l5mE6yEGA5CxVUGI"
+ADMIN_TELEGRAM_ID = "1637635130"
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -24,7 +29,8 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         first_name TEXT,
         last_name TEXT,
-        status TEXT DEFAULT 'pending'
+        status TEXT DEFAULT 'pending',
+        created_at TEXT
     )""")
     
     c.execute("""CREATE TABLE IF NOT EXISTS users (
@@ -39,7 +45,8 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS chats (
         id TEXT PRIMARY KEY,
         name TEXT,
-        is_group INTEGER DEFAULT 0
+        is_group INTEGER DEFAULT 0,
+        created_by INTEGER
     )""")
     
     c.execute("""CREATE TABLE IF NOT EXISTS chat_members (
@@ -62,43 +69,60 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS stickers (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
-        url TEXT
+        url TEXT,
+        name TEXT
     )""")
     
-    # Админ по умолчанию
-    c.execute("INSERT OR IGNORE INTO users (id, first_name, last_name) VALUES (1, 'Админ', 'Главный')")
+    c.execute("INSERT OR IGNORE INTO users (id, first_name, last_name) VALUES (1, 'Admin', 'Admin')")
     
     conn.commit()
     conn.close()
 
 init_db()
 
+# ========== ОТПРАВКА В TELEGRAM ==========
+async def send_telegram_message(text, reply_markup=None):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": ADMIN_TELEGRAM_ID,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    
+    async with httpx.AsyncClient() as client:
+        await client.post(url, json=payload)
+
+async def notify_admin_new_request(user_id, first_name, last_name):
+    text = f"🆕 <b>Новая заявка!</b>\n\n👤 <b>{first_name} {last_name}</b>\n🆔 ID: {user_id}"
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Одобрить", "callback_data": f"approve_{user_id}"},
+                {"text": "❌ Отклонить", "callback_data": f"reject_{user_id}"}
+            ]
+        ]
+    }
+    await send_telegram_message(text, json.dumps(keyboard))
+
 # ========== МОДЕЛИ ==========
 class PendingUser(BaseModel):
     first_name: str
     last_name: str
 
-class ApproveUser(BaseModel):
-    user_id: int
-    approved: bool
-
 class CreateChat(BaseModel):
     name: str
     user_ids: List[int]
 
-class ThemeUpdate(BaseModel):
-    theme: str
-    wallpaper_url: Optional[str] = None
-
 # ========== WebSocket МЕНЕДЖЕР ==========
 class ConnectionManager:
     def __init__(self):
-        self.active: Dict[int, WebSocket] = {}  # user_id -> websocket
+        self.active: Dict[int, WebSocket] = {}
 
     async def connect(self, user_id: int, websocket: WebSocket):
         await websocket.accept()
         self.active[user_id] = websocket
-        await self.broadcast_status()
 
     def disconnect(self, user_id: int):
         if user_id in self.active:
@@ -119,92 +143,93 @@ class ConnectionManager:
             if user_id != sender_id and user_id in self.active:
                 await self.active[user_id].send_json(message)
 
-    async def broadcast_status(self):
-        online = list(self.active.keys())
-        for ws in self.active.values():
-            await ws.send_json({"type": "online_users", "users": online})
-
 manager = ConnectionManager()
 
 # ========== API РОУТЫ ==========
 
-# Подача заявки
 @app.post("/api/apply")
-def apply(user: PendingUser):
+async def apply(user: PendingUser):
     conn = sqlite3.connect("messenger.db")
     c = conn.cursor()
-    c.execute("INSERT INTO pending_users (first_name, last_name) VALUES (?, ?)",
-              (user.first_name, user.last_name))
+    c.execute("INSERT INTO pending_users (first_name, last_name, created_at) VALUES (?, ?, ?)",
+              (user.first_name, user.last_name, datetime.datetime.now().isoformat()))
     conn.commit()
     user_id = c.lastrowid
     conn.close()
     
-    # Уведомляем админа (user_id=1)
-    asyncio.create_task(manager.send_personal({
-        "type": "new_application",
-        "user_id": user_id,
-        "first_name": user.first_name,
-        "last_name": user.last_name
-    }, 1))
+    # Уведомление в Telegram
+    await notify_admin_new_request(user_id, user.first_name, user.last_name)
     
     return {"status": "pending", "user_id": user_id}
 
-# Проверить статус заявки
 @app.get("/api/check_status/{user_id}")
 def check_status(user_id: int):
     conn = sqlite3.connect("messenger.db")
     c = conn.cursor()
     
-    # Проверяем в pending
     c.execute("SELECT status FROM pending_users WHERE id = ?", (user_id,))
     row = c.fetchone()
     if row:
+        if row[0] == "approved":
+            c.execute("SELECT id, first_name, last_name FROM users WHERE id = ?", (user_id,))
+            user = c.fetchone()
+            conn.close()
+            return {"status": "approved", "user": {"id": user[0], "first_name": user[1], "last_name": user[2]}}
         conn.close()
         return {"status": row[0]}
     
-    # Проверяем в users (одобрен)
-    c.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-    row = c.fetchone()
+    c.execute("SELECT id, first_name, last_name FROM users WHERE id = ?", (user_id,))
+    user = c.fetchone()
     conn.close()
-    if row:
-        return {"status": "approved"}
+    if user:
+        return {"status": "approved", "user": {"id": user[0], "first_name": user[1], "last_name": user[2]}}
     
     return {"status": "unknown"}
 
-# Получить список заявок (для админа)
 @app.get("/api/pending")
 def get_pending():
     conn = sqlite3.connect("messenger.db")
     c = conn.cursor()
-    c.execute("SELECT id, first_name, last_name, status FROM pending_users WHERE status = 'pending'")
-    pending = [{"id": r[0], "first_name": r[1], "last_name": r[2]} for r in c.fetchall()]
+    c.execute("SELECT id, first_name, last_name, created_at FROM pending_users WHERE status = 'pending'")
+    pending = [{"id": r[0], "first_name": r[1], "last_name": r[2], "created_at": r[3]} for r in c.fetchall()]
     conn.close()
     return {"pending": pending}
 
-# Одобрить или отклонить
-@app.post("/api/approve")
-def approve(data: ApproveUser):
+@app.post("/api/approve/{user_id}")
+def approve_user(user_id: int):
     conn = sqlite3.connect("messenger.db")
     c = conn.cursor()
     
-    c.execute("SELECT * FROM pending_users WHERE id = ? AND status = 'pending'", (data.user_id,))
+    c.execute("SELECT * FROM pending_users WHERE id = ? AND status = 'pending'", (user_id,))
     user = c.fetchone()
     if not user:
         conn.close()
         raise HTTPException(status_code=404, detail="Заявка не найдена")
     
-    if data.approved:
-        c.execute("UPDATE pending_users SET status = 'approved' WHERE id = ?", (data.user_id,))
-        c.execute("INSERT INTO users (id, first_name, last_name) VALUES (?, ?, ?)",
-                  (user[0], user[1], user[2]))
-    else:
-        c.execute("UPDATE pending_users SET status = 'rejected' WHERE id = ?", (data.user_id,))
+    c.execute("UPDATE pending_users SET status = 'approved' WHERE id = ?", (user_id,))
+    c.execute("INSERT INTO users (id, first_name, last_name) VALUES (?, ?, ?)",
+              (user[0], user[1], user[2]))
+    
+    # Создаём общий чат с админом
+    chat_id = str(uuid.uuid4())[:8]
+    c.execute("INSERT INTO chats (id, name, is_group, created_by) VALUES (?, ?, 0, ?)",
+              (chat_id, f"{user[1]} {user[2]}", 1))
+    c.execute("INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)", (chat_id, 1))
+    c.execute("INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)", (chat_id, user_id))
     
     conn.commit()
     conn.close()
     return {"status": "ok"}
 
-# Получить список пользователей
+@app.post("/api/reject/{user_id}")
+def reject_user(user_id: int):
+    conn = sqlite3.connect("messenger.db")
+    c = conn.cursor()
+    c.execute("UPDATE pending_users SET status = 'rejected' WHERE id = ? AND status = 'pending'", (user_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
 @app.get("/api/users")
 def get_users():
     conn = sqlite3.connect("messenger.db")
@@ -214,37 +239,35 @@ def get_users():
     conn.close()
     return {"users": users}
 
-# Создать чат
 @app.post("/api/create_chat")
 def create_chat(data: CreateChat):
     chat_id = str(uuid.uuid4())[:8]
     conn = sqlite3.connect("messenger.db")
     c = conn.cursor()
-    c.execute("INSERT INTO chats (id, name, is_group) VALUES (?, ?, ?)",
-              (chat_id, data.name, 1 if len(data.user_ids) > 2 else 0))
+    is_group = len(data.user_ids) > 2
+    c.execute("INSERT INTO chats (id, name, is_group, created_by) VALUES (?, ?, ?, ?)",
+              (chat_id, data.name, 1 if is_group else 0, data.user_ids[0]))
     for user_id in data.user_ids:
         c.execute("INSERT OR IGNORE INTO chat_members (chat_id, user_id) VALUES (?, ?)",
                   (chat_id, user_id))
     conn.commit()
     conn.close()
-    return {"chat_id": chat_id}
+    return {"chat_id": chat_id, "name": data.name}
 
-# Получить чаты пользователя
 @app.get("/api/my_chats/{user_id}")
 def my_chats(user_id: int):
     conn = sqlite3.connect("messenger.db")
     c = conn.cursor()
-    c.execute("""SELECT c.id, c.name FROM chats c 
+    c.execute("""SELECT c.id, c.name, c.is_group FROM chats c 
                  JOIN chat_members cm ON c.id = cm.chat_id 
                  WHERE cm.user_id = ?""", (user_id,))
-    chats = [{"id": r[0], "name": r[1]} for r in c.fetchall()]
+    chats = [{"id": r[0], "name": r[1], "is_group": r[2]} for r in c.fetchall()]
     conn.close()
     return {"chats": chats}
 
-# Загрузить файл
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
-    ext = file.filename.split(".")[-1]
+    ext = file.filename.split(".")[-1] if "." in file.filename else "file"
     filename = f"{uuid.uuid4()}.{ext}"
     filepath = os.path.join(UPLOAD_DIR, filename)
     
@@ -252,10 +275,10 @@ async def upload_file(file: UploadFile = File(...)):
         content = await file.read()
         f.write(content)
     
-    file_type = "image" if ext in ["jpg", "jpeg", "png", "gif"] else "video" if ext in ["mp4"] else "file"
+    file_type = "image" if ext.lower() in ["jpg", "jpeg", "png", "gif", "webp"] else \
+                "video" if ext.lower() in ["mp4", "mov", "webm"] else "file"
     return {"url": f"/uploads/{filename}", "type": file_type}
 
-# Получить сообщения
 @app.get("/api/messages/{chat_id}")
 def get_messages(chat_id: str, limit: int = 50):
     conn = sqlite3.connect("messenger.db")
@@ -267,6 +290,42 @@ def get_messages(chat_id: str, limit: int = 50):
                  "file_url": r[3], "file_type": r[4], "timestamp": r[5]} for r in c.fetchall()]
     conn.close()
     return {"messages": list(reversed(messages))}
+
+# Webhook для Telegram
+@app.post("/api/telegram-webhook")
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    
+    if "callback_query" in data:
+        callback = data["callback_query"]
+        data_callback = callback["data"]
+        chat_id = callback["message"]["chat"]["id"]
+        message_id = callback["message"]["message_id"]
+        
+        if data_callback.startswith("approve_"):
+            user_id = int(data_callback.split("_")[1])
+            approve_user(user_id)
+            
+            # Обновляем сообщение в Telegram
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+            await httpx.AsyncClient().post(url, json={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": f"✅ Заявка #{user_id} одобрена!"
+            })
+            
+        elif data_callback.startswith("reject_"):
+            user_id = int(data_callback.split("_")[1])
+            reject_user(user_id)
+            
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+            await httpx.AsyncClient().post(url, json={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": f"❌ Заявка #{user_id} отклонена"
+            })
+    
+    return {"status": "ok"}
 
 # ========== WebSocket ==========
 @app.websocket("/ws/{user_id}")
@@ -301,7 +360,6 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                 
     except WebSocketDisconnect:
         manager.disconnect(user_id)
-        await manager.broadcast_status()
 
 # Раздача статики
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
@@ -310,6 +368,16 @@ app.mount("/static", StaticFiles(directory="static", html=True), name="static")
 @app.get("/")
 def root():
     return FileResponse("static/index.html")
+
+# ========== УСТАНОВКА WEBHOOK TELEGRAM ==========
+@app.on_event("startup")
+async def set_webhook():
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "https://test-c1u3.onrender.com")
+    webhook_url = f"{render_url}/api/telegram-webhook"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+    async with httpx.AsyncClient() as client:
+        await client.post(url, json={"url": webhook_url})
+    print(f"Webhook set to {webhook_url}")
 
 if __name__ == "__main__":
     import uvicorn
