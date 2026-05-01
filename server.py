@@ -79,7 +79,8 @@ def init_db():
     conn.close()
 
 init_db()
-
+# Настройка SQlite для многопоточности 
+sqlite3.threadsafety = 3
 # ========== ОТПРАВКА В TELEGRAM ==========
 async def send_telegram_message(text, reply_markup=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
