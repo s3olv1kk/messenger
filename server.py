@@ -25,7 +25,6 @@ def init_db():
     conn = sqlite3.connect("messenger.db", timeout=10)
     c = conn.cursor()
     
-    # Сброс — только один раз
     c.execute("DROP TABLE IF EXISTS pending_users")
     c.execute("DROP TABLE IF EXISTS users")
     c.execute("DROP TABLE IF EXISTS chats")
@@ -33,12 +32,12 @@ def init_db():
     c.execute("DROP TABLE IF EXISTS messages")
     c.execute("DROP TABLE IF EXISTS posts")
     
-    c.execute("CREATE TABLE IF NOT EXISTS pending_users (id INTEGER PRIMARY KEY AUTOINCREMENT,first_name TEXT,last_name TEXT,password TEXT,phone TEXT,status TEXT DEFAULT 'pending',created_at TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT,first_name TEXT,last_name TEXT,password TEXT,phone TEXT,avatar_url TEXT,bio TEXT,theme TEXT DEFAULT 'dark',wallpaper_url TEXT,custom_theme TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS chats (id TEXT PRIMARY KEY,name TEXT,is_group INTEGER DEFAULT 0,created_by INTEGER)")
-    c.execute("CREATE TABLE IF NOT EXISTS chat_members (chat_id TEXT,user_id INTEGER)")
-    c.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id TEXT,sender_id INTEGER,sender_name TEXT,text TEXT,file_url TEXT,file_type TEXT,timestamp TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS posts (id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,text TEXT,file_url TEXT,file_type TEXT,timestamp TEXT)")
+    c.execute("CREATE TABLE pending_users (id INTEGER PRIMARY KEY AUTOINCREMENT,first_name TEXT,last_name TEXT,password TEXT,phone TEXT,status TEXT DEFAULT 'pending',created_at TEXT)")
+    c.execute("CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT,first_name TEXT,last_name TEXT,password TEXT,phone TEXT,avatar_url TEXT,bio TEXT,theme TEXT DEFAULT 'dark',wallpaper_url TEXT,custom_theme TEXT)")
+    c.execute("CREATE TABLE chats (id TEXT PRIMARY KEY,name TEXT,is_group INTEGER DEFAULT 0,created_by INTEGER)")
+    c.execute("CREATE TABLE chat_members (chat_id TEXT,user_id INTEGER)")
+    c.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id TEXT,sender_id INTEGER,sender_name TEXT,text TEXT,file_url TEXT,file_type TEXT,timestamp TEXT)")
+    c.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,text TEXT,file_url TEXT,file_type TEXT,timestamp TEXT)")
     
     conn.commit()
     conn.close()
