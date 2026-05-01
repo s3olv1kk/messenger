@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Request, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -15,49 +15,60 @@ app = FastAPI()
 
 # ===== НАСТРОЙКИ =====
 TELEGRAM_BOT_TOKEN = "8650988930:AAHk5gbchTiE5_zhgR0l5mE6yEGA5CxVUGI"
-ADMIN_TELEGRAM_ID = 1637635130  # Твой Telegram ID — ты владелец бота
+ADMIN_TELEGRAM_ID = 1637635130
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs("avatars", exist_ok=True)
+os.makedirs("voice", exist_ok=True)
 
 # ========== БАЗА ДАННЫХ ==========
 def init_db():
-    conn = sqlite3.connect("messenger.db")
+    conn = sqlite3.connect("messenger.db", timeout=10)
     c = conn.cursor()
     
-    c.execute("""CREATE TABLE IF NOT EXISTS pending_users (
+    # Полный сброс
+    c.execute("DROP TABLE IF EXISTS pending_users")
+    c.execute("DROP TABLE IF EXISTS users")
+    c.execute("DROP TABLE IF EXISTS chats")
+    c.execute("DROP TABLE IF EXISTS chat_members")
+    c.execute("DROP TABLE IF EXISTS messages")
+    c.execute("DROP TABLE IF EXISTS stickers")
+    
+    c.execute("""CREATE TABLE pending_users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         first_name TEXT,
         last_name TEXT,
+        password TEXT,
         status TEXT DEFAULT 'pending',
         created_at TEXT
     )""")
     
-    c.execute("""CREATE TABLE IF NOT EXISTS users (
+    c.execute("""CREATE TABLE users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         first_name TEXT,
         last_name TEXT,
+        password TEXT,
         avatar_url TEXT,
         theme TEXT DEFAULT 'dark',
         wallpaper_url TEXT,
         custom_theme TEXT
     )""")
     
-    c.execute("""CREATE TABLE IF NOT EXISTS chats (
+    c.execute("""CREATE TABLE chats (
         id TEXT PRIMARY KEY,
         name TEXT,
         is_group INTEGER DEFAULT 0,
         created_by INTEGER
     )""")
     
-    c.execute("""CREATE TABLE IF NOT EXISTS chat_members (
+    c.execute("""CREATE TABLE chat_members (
         chat_id TEXT,
         user_id INTEGER,
         FOREIGN KEY (chat_id) REFERENCES chats(id)
     )""")
     
-    c.execute("""CREATE TABLE IF NOT EXISTS messages (
+    c.execute("""CREATE TABLE messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id TEXT,
         sender_id INTEGER,
@@ -68,7 +79,7 @@ def init_db():
         timestamp TEXT
     )""")
     
-    c.execute("""CREATE TABLE IF NOT EXISTS stickers (
+    c.execute("""CREATE TABLE stickers (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
         url TEXT,
@@ -79,8 +90,7 @@ def init_db():
     conn.close()
 
 init_db()
-# Настройка SQlite для многопоточности 
-sqlite3.threadsafety = 3
+
 # ========== ОТПРАВКА В TELEGRAM ==========
 async def send_telegram_message(text, reply_markup=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -100,22 +110,15 @@ async def notify_admin_new_request(user_id, first_name, last_name):
     }
     await send_telegram_message(text, json.dumps(keyboard))
 
-# ========== ПРОВЕРКА АДМИНА ==========
-def is_admin(user_id: int) -> bool:
-    # Админ — только владелец бота (чей Telegram ID совпадает)
-    conn = sqlite3.connect("messenger.db")
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM users WHERE id = ?", (user_id,))
-    count = c.fetchone()[0]
-    conn.close()
-    # Владелец бота имеет Telegram ID = ADMIN_TELEGRAM_ID
-    # При регистрации админа создаём пользователя с id = ADMIN_TELEGRAM_ID
-    return user_id == ADMIN_TELEGRAM_ID
-
 # ========== МОДЕЛИ ==========
 class PendingUser(BaseModel):
     first_name: str
     last_name: str
+    password: str
+
+class LoginRequest(BaseModel):
+    user_id: int
+    password: str
 
 class CreateChat(BaseModel):
     name: str
@@ -125,9 +128,6 @@ class ThemeUpdate(BaseModel):
     theme: Optional[str] = None
     wallpaper_url: Optional[str] = None
     custom_theme: Optional[str] = None
-    msg_color: Optional[str] = None
-    my_msg_color: Optional[str] = None
-    text_color: Optional[str] = None
 
 # ========== WebSocket МЕНЕДЖЕР ==========
 class ConnectionManager:
@@ -142,12 +142,8 @@ class ConnectionManager:
         if user_id in self.active:
             del self.active[user_id]
 
-    async def send_personal(self, message: dict, user_id: int):
-        if user_id in self.active:
-            await self.active[user_id].send_json(message)
-
     async def broadcast_to_chat(self, message: dict, chat_id: str, sender_id: int = None):
-        conn = sqlite3.connect("messenger.db")
+        conn = sqlite3.connect("messenger.db", timeout=10)
         c = conn.cursor()
         c.execute("SELECT user_id FROM chat_members WHERE chat_id = ?", (chat_id,))
         members = [r[0] for r in c.fetchall()]
@@ -163,10 +159,10 @@ manager = ConnectionManager()
 
 @app.post("/api/apply")
 async def apply(user: PendingUser):
-    conn = sqlite3.connect("messenger.db")
+    conn = sqlite3.connect("messenger.db", timeout=10)
     c = conn.cursor()
-    c.execute("INSERT INTO pending_users (first_name, last_name, created_at) VALUES (?, ?, ?)",
-              (user.first_name, user.last_name, datetime.datetime.now().isoformat()))
+    c.execute("INSERT INTO pending_users (first_name, last_name, password, created_at) VALUES (?, ?, ?, ?)",
+              (user.first_name, user.last_name, user.password, datetime.datetime.now().isoformat()))
     conn.commit()
     user_id = c.lastrowid
     conn.close()
@@ -174,12 +170,32 @@ async def apply(user: PendingUser):
     await notify_admin_new_request(user_id, user.first_name, user.last_name)
     return {"status": "pending", "user_id": user_id}
 
+@app.post("/api/login")
+def login(data: LoginRequest):
+    conn = sqlite3.connect("messenger.db", timeout=10)
+    c = conn.cursor()
+    c.execute("SELECT id, first_name, last_name, avatar_url, theme, wallpaper_url, custom_theme FROM users WHERE id = ? AND password = ?",
+              (data.user_id, data.password))
+    user = c.fetchone()
+    conn.close()
+    if user:
+        return {"status": "ok", "user": {"id": user[0], "first_name": user[1], "last_name": user[2], "avatar_url": user[3], "theme": user[4], "wallpaper_url": user[5], "custom_theme": user[6]}}
+    raise HTTPException(status_code=403, detail="Неверный ID или пароль")
+
+@app.post("/api/reset_password/{user_id}")
+def reset_password(user_id: int, new_password: str = Query(...)):
+    conn = sqlite3.connect("messenger.db", timeout=10)
+    c = conn.cursor()
+    c.execute("UPDATE users SET password = ? WHERE id = ?", (new_password, user_id))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
 @app.get("/api/check_status/{user_id}")
 def check_status(user_id: int):
-    conn = sqlite3.connect("messenger.db")
+    conn = sqlite3.connect("messenger.db", timeout=10)
     c = conn.cursor()
     
-    # Проверяем pending
     c.execute("SELECT status FROM pending_users WHERE id = ?", (user_id,))
     row = c.fetchone()
     if row:
@@ -192,7 +208,6 @@ def check_status(user_id: int):
         conn.close()
         return {"status": row[0]}
     
-    # Проверяем сразу в users (админ)
     c.execute("SELECT id, first_name, last_name, avatar_url, theme, wallpaper_url, custom_theme FROM users WHERE id = ?", (user_id,))
     user = c.fetchone()
     conn.close()
@@ -203,7 +218,7 @@ def check_status(user_id: int):
 
 @app.post("/api/approve/{user_id}")
 def approve_user(user_id: int):
-    conn = sqlite3.connect("messenger.db")
+    conn = sqlite3.connect("messenger.db", timeout=10)
     c = conn.cursor()
     
     c.execute("SELECT * FROM pending_users WHERE id = ? AND status = 'pending'", (user_id,))
@@ -213,10 +228,9 @@ def approve_user(user_id: int):
         raise HTTPException(status_code=404)
     
     c.execute("UPDATE pending_users SET status = 'approved' WHERE id = ?", (user_id,))
-    c.execute("INSERT INTO users (id, first_name, last_name) VALUES (?, ?, ?)",
-              (user[0], user[1], user[2]))
+    c.execute("INSERT INTO users (id, first_name, last_name, password) VALUES (?, ?, ?, ?)",
+              (user[0], user[1], user[2], user[3]))
     
-    # Создаём чат с владельцем бота
     chat_id = str(uuid.uuid4())[:8]
     c.execute("INSERT INTO chats (id, name, is_group, created_by) VALUES (?, ?, 0, ?)",
               (chat_id, f"{user[1]} {user[2]}", ADMIN_TELEGRAM_ID))
@@ -229,7 +243,7 @@ def approve_user(user_id: int):
 
 @app.post("/api/reject/{user_id}")
 def reject_user(user_id: int):
-    conn = sqlite3.connect("messenger.db")
+    conn = sqlite3.connect("messenger.db", timeout=10)
     c = conn.cursor()
     c.execute("UPDATE pending_users SET status = 'rejected' WHERE id = ? AND status = 'pending'", (user_id,))
     conn.commit()
@@ -238,7 +252,7 @@ def reject_user(user_id: int):
 
 @app.get("/api/users")
 def get_users():
-    conn = sqlite3.connect("messenger.db")
+    conn = sqlite3.connect("messenger.db", timeout=10)
     c = conn.cursor()
     c.execute("SELECT id, first_name, last_name, avatar_url FROM users")
     users = [{"id": r[0], "first_name": r[1], "last_name": r[2], "avatar_url": r[3]} for r in c.fetchall()]
@@ -247,7 +261,7 @@ def get_users():
 
 @app.get("/api/me/{user_id}")
 def get_me(user_id: int):
-    conn = sqlite3.connect("messenger.db")
+    conn = sqlite3.connect("messenger.db", timeout=10)
     c = conn.cursor()
     c.execute("SELECT id, first_name, last_name, avatar_url, theme, wallpaper_url, custom_theme FROM users WHERE id = ?", (user_id,))
     user = c.fetchone()
@@ -258,7 +272,7 @@ def get_me(user_id: int):
 
 @app.post("/api/update_theme/{user_id}")
 def update_theme(user_id: int, data: ThemeUpdate):
-    conn = sqlite3.connect("messenger.db")
+    conn = sqlite3.connect("messenger.db", timeout=10)
     c = conn.cursor()
     if data.theme:
         c.execute("UPDATE users SET theme = ? WHERE id = ?", (data.theme, user_id))
@@ -281,7 +295,7 @@ async def upload_avatar(user_id: int, file: UploadFile = File(...)):
         f.write(content)
     
     url = f"/avatars/{filename}"
-    conn = sqlite3.connect("messenger.db")
+    conn = sqlite3.connect("messenger.db", timeout=10)
     c = conn.cursor()
     c.execute("UPDATE users SET avatar_url = ? WHERE id = ?", (url, user_id))
     conn.commit()
@@ -291,7 +305,7 @@ async def upload_avatar(user_id: int, file: UploadFile = File(...)):
 @app.post("/api/create_chat")
 def create_chat(data: CreateChat):
     chat_id = str(uuid.uuid4())[:8]
-    conn = sqlite3.connect("messenger.db")
+    conn = sqlite3.connect("messenger.db", timeout=10)
     c = conn.cursor()
     c.execute("INSERT INTO chats (id, name, is_group, created_by) VALUES (?, ?, ?, ?)",
               (chat_id, data.name, 1 if len(data.user_ids) > 2 else 0, data.user_ids[0]))
@@ -303,7 +317,7 @@ def create_chat(data: CreateChat):
 
 @app.get("/api/my_chats/{user_id}")
 def my_chats(user_id: int):
-    conn = sqlite3.connect("messenger.db")
+    conn = sqlite3.connect("messenger.db", timeout=10)
     c = conn.cursor()
     c.execute("""SELECT c.id, c.name, c.is_group FROM chats c 
                  JOIN chat_members cm ON c.id = cm.chat_id WHERE cm.user_id = ?""", (user_id,))
@@ -321,12 +335,23 @@ async def upload_file(file: UploadFile = File(...)):
         content = await file.read()
         f.write(content)
     
-    file_type = "image" if ext.lower() in ["jpg","jpeg","png","gif","webp"] else "video" if ext.lower() in ["mp4","mov","webm"] else "file"
+    file_type = "image" if ext.lower() in ["jpg","jpeg","png","gif","webp"] else "video" if ext.lower() in ["mp4","mov","webm"] else "voice" if ext.lower() in ["mp3","wav","ogg","webm","m4a"] else "file"
     return {"url": f"/uploads/{filename}", "type": file_type}
+
+@app.post("/api/upload_voice")
+async def upload_voice(file: UploadFile = File(...)):
+    filename = f"{uuid.uuid4()}.webm"
+    filepath = os.path.join("voice", filename)
+    
+    with open(filepath, "wb") as f:
+        content = await file.read()
+        f.write(content)
+    
+    return {"url": f"/voice/{filename}", "type": "voice"}
 
 @app.get("/api/messages/{chat_id}")
 def get_messages(chat_id: str, limit: int = 50):
-    conn = sqlite3.connect("messenger.db")
+    conn = sqlite3.connect("messenger.db", timeout=10)
     c = conn.cursor()
     c.execute("""SELECT sender_id, sender_name, text, file_url, file_type, timestamp 
                  FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?""", (chat_id, limit))
@@ -336,7 +361,7 @@ def get_messages(chat_id: str, limit: int = 50):
 
 @app.get("/api/pending")
 def get_pending():
-    conn = sqlite3.connect("messenger.db")
+    conn = sqlite3.connect("messenger.db", timeout=10)
     c = conn.cursor()
     c.execute("SELECT id, first_name, last_name, created_at FROM pending_users WHERE status = 'pending'")
     pending = [{"id":r[0],"first_name":r[1],"last_name":r[2],"created_at":r[3]} for r in c.fetchall()]
@@ -390,7 +415,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     "timestamp": datetime.datetime.now().isoformat()
                 }
                 
-                conn = sqlite3.connect("messenger.db")
+                conn = sqlite3.connect("messenger.db", timeout=10)
                 c = conn.cursor()
                 c.execute("INSERT INTO messages (chat_id,sender_id,sender_name,text,file_url,file_type,timestamp) VALUES (?,?,?,?,?,?,?)",
                          (msg["chat_id"],user_id,msg["sender_name"],msg["text"],msg["file_url"],msg["file_type"],msg["timestamp"]))
@@ -405,6 +430,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
 # ========== СТАТИКА ==========
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 app.mount("/avatars", StaticFiles(directory="avatars"), name="avatars")
+app.mount("/voice", StaticFiles(directory="voice"), name="voice")
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
 
 @app.get("/")
