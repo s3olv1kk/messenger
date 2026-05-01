@@ -64,16 +64,28 @@ class PostCreate(BaseModel):
     text: Optional[str] = None; file_url: Optional[str] = None; file_type: Optional[str] = None
 
 class ConnectionManager:
-    def __init__(self): self.active: Dict[int, WebSocket] = {}
-    async def connect(self, uid, ws): await ws.accept(); self.active[uid] = ws
-    def disconnect(self, uid):
-        if uid in self.active: del self.active[uid]
-    async def broadcast_to_chat(self, msg, chat_id, sender_id=None):
+    def __init__(self):
+        self.active: Dict[int, WebSocket] = {}
+
+    async def connect(self, uid: int, ws: WebSocket):
+        await ws.accept()
+        self.active[uid] = ws
+
+    def disconnect(self, uid: int):
+        if uid in self.active:
+            del self.active[uid]
+
+    async def broadcast_to_chat(self, msg: dict, chat_id: str, sender_id: int = None):
+        """Отправляет сообщение ВСЕМ участникам чата, включая отправителя (чтобы отобразить своё сообщение)."""
         conn = sqlite3.connect("messenger.db", timeout=10)
-        c = conn.cursor(); c.execute("SELECT user_id FROM chat_members WHERE chat_id=?", (chat_id,))
-        members = [r[0] for r in c.fetchall()]; conn.close()
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM chat_members WHERE chat_id=?", (chat_id,))
+        members = [r[0] for r in c.fetchall()]
+        conn.close()
+
         for uid in members:
-            if uid != sender_id and uid in self.active: await self.active[uid].send_json(msg)
+            if uid in self.active:
+                await self.active[uid].send_json(msg)
 
 manager = ConnectionManager()
 
