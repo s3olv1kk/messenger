@@ -27,15 +27,7 @@ def init_db():
     conn = sqlite3.connect("messenger.db", timeout=10)
     c = conn.cursor()
     
-    # Полный сброс
-    c.execute("DROP TABLE IF EXISTS pending_users")
-    c.execute("DROP TABLE IF EXISTS users")
-    c.execute("DROP TABLE IF EXISTS chats")
-    c.execute("DROP TABLE IF EXISTS chat_members")
-    c.execute("DROP TABLE IF EXISTS messages")
-    c.execute("DROP TABLE IF EXISTS stickers")
-    
-    c.execute("""CREATE TABLE pending_users (
+    c.execute("""CREATE TABLE IF NOT EXISTS pending_users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         first_name TEXT,
         last_name TEXT,
@@ -44,7 +36,7 @@ def init_db():
         created_at TEXT
     )""")
     
-    c.execute("""CREATE TABLE users (
+    c.execute("""CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         first_name TEXT,
         last_name TEXT,
@@ -55,20 +47,20 @@ def init_db():
         custom_theme TEXT
     )""")
     
-    c.execute("""CREATE TABLE chats (
+    c.execute("""CREATE TABLE IF NOT EXISTS chats (
         id TEXT PRIMARY KEY,
         name TEXT,
         is_group INTEGER DEFAULT 0,
         created_by INTEGER
     )""")
     
-    c.execute("""CREATE TABLE chat_members (
+    c.execute("""CREATE TABLE IF NOT EXISTS chat_members (
         chat_id TEXT,
         user_id INTEGER,
         FOREIGN KEY (chat_id) REFERENCES chats(id)
     )""")
     
-    c.execute("""CREATE TABLE messages (
+    c.execute("""CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id TEXT,
         sender_id INTEGER,
@@ -79,7 +71,7 @@ def init_db():
         timestamp TEXT
     )""")
     
-    c.execute("""CREATE TABLE stickers (
+    c.execute("""CREATE TABLE IF NOT EXISTS stickers (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
         url TEXT,
