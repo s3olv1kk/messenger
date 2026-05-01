@@ -1,84 +1,123 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 import sqlite3
 import json
-import hashlib
 import datetime
 import asyncio
-from typing import Dict, List
+import os
+import uuid
+from typing import Dict, List, Optional
 
 app = FastAPI()
+
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ========== БАЗА ДАННЫХ ==========
 def init_db():
     conn = sqlite3.connect("messenger.db")
     c = conn.cursor()
+    
+    c.execute("""CREATE TABLE IF NOT EXISTS pending_users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        first_name TEXT,
+        last_name TEXT,
+        status TEXT DEFAULT 'pending'
+    )""")
+    
     c.execute("""CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE,
-        avatar_color TEXT,
-        invite_code TEXT
+        first_name TEXT,
+        last_name TEXT,
+        avatar_url TEXT,
+        theme TEXT DEFAULT 'dark',
+        wallpaper_url TEXT
     )""")
+    
+    c.execute("""CREATE TABLE IF NOT EXISTS chats (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        is_group INTEGER DEFAULT 0
+    )""")
+    
+    c.execute("""CREATE TABLE IF NOT EXISTS chat_members (
+        chat_id TEXT,
+        user_id INTEGER,
+        FOREIGN KEY (chat_id) REFERENCES chats(id)
+    )""")
+    
     c.execute("""CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sender TEXT,
         chat_id TEXT,
+        sender_id INTEGER,
+        sender_name TEXT,
         text TEXT,
+        file_url TEXT,
+        file_type TEXT,
         timestamp TEXT
     )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS invites (
-        code TEXT PRIMARY KEY,
-        created_by TEXT,
-        used INTEGER DEFAULT 0
+    
+    c.execute("""CREATE TABLE IF NOT EXISTS stickers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        url TEXT
     )""")
-    # Создаём инвайт-код, если его нет
-    c.execute("INSERT OR IGNORE INTO invites (code, created_by) VALUES (?, ?)", ("CLUB2024", "admin"))
+    
+    # Админ по умолчанию
+    c.execute("INSERT OR IGNORE INTO users (id, first_name, last_name) VALUES (1, 'Админ', 'Главный')")
+    
     conn.commit()
     conn.close()
 
 init_db()
 
 # ========== МОДЕЛИ ==========
-class UserCreate(BaseModel):
-    name: str
-    invite_code: str
+class PendingUser(BaseModel):
+    first_name: str
+    last_name: str
 
-class MessageRequest(BaseModel):
-    sender: str
-    chat_id: str
-    text: str
+class ApproveUser(BaseModel):
+    user_id: int
+    approved: bool
+
+class CreateChat(BaseModel):
+    name: str
+    user_ids: List[int]
+
+class ThemeUpdate(BaseModel):
+    theme: str
+    wallpaper_url: Optional[str] = None
 
 # ========== WebSocket МЕНЕДЖЕР ==========
 class ConnectionManager:
     def __init__(self):
-        self.active: Dict[str, WebSocket] = {}
-        self.typing_status: Dict[str, Dict[str, bool]] = {}  # chat_id -> {username: typing}
+        self.active: Dict[int, WebSocket] = {}  # user_id -> websocket
 
-    async def connect(self, username: str, websocket: WebSocket):
+    async def connect(self, user_id: int, websocket: WebSocket):
         await websocket.accept()
-        self.active[username] = websocket
+        self.active[user_id] = websocket
         await self.broadcast_status()
 
-    def disconnect(self, username: str):
-        if username in self.active:
-            del self.active[username]
-        # Убираем статус печати
-        for chat_id in self.typing_status:
-            if username in self.typing_status[chat_id]:
-                del self.typing_status[chat_id][username]
+    def disconnect(self, user_id: int):
+        if user_id in self.active:
+            del self.active[user_id]
 
-    async def send_personal(self, message: dict, username: str):
-        if username in self.active:
-            await self.active[username].send_json(message)
+    async def send_personal(self, message: dict, user_id: int):
+        if user_id in self.active:
+            await self.active[user_id].send_json(message)
 
-    async def broadcast_to_chat(self, message: dict, chat_id: str, exclude: str = None):
-        # В нашей простой модели chat_id = "general" для общего чата
-        # или "user1_user2" для личного (алфавитный порядок)
-        for username, ws in self.active.items():
-            if username != exclude:
-                await ws.send_json(message)
+    async def broadcast_to_chat(self, message: dict, chat_id: str, sender_id: int = None):
+        conn = sqlite3.connect("messenger.db")
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM chat_members WHERE chat_id = ?", (chat_id,))
+        members = [r[0] for r in c.fetchall()]
+        conn.close()
+        
+        for user_id in members:
+            if user_id != sender_id and user_id in self.active:
+                await self.active[user_id].send_json(message)
 
     async def broadcast_status(self):
         online = list(self.active.keys())
@@ -88,115 +127,190 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 # ========== API РОУТЫ ==========
-@app.post("/api/register")
-def register(user: UserCreate):
+
+# Подача заявки
+@app.post("/api/apply")
+def apply(user: PendingUser):
+    conn = sqlite3.connect("messenger.db")
+    c = conn.cursor()
+    c.execute("INSERT INTO pending_users (first_name, last_name) VALUES (?, ?)",
+              (user.first_name, user.last_name))
+    conn.commit()
+    user_id = c.lastrowid
+    conn.close()
+    
+    # Уведомляем админа (user_id=1)
+    asyncio.create_task(manager.send_personal({
+        "type": "new_application",
+        "user_id": user_id,
+        "first_name": user.first_name,
+        "last_name": user.last_name
+    }, 1))
+    
+    return {"status": "pending", "user_id": user_id}
+
+# Проверить статус заявки
+@app.get("/api/check_status/{user_id}")
+def check_status(user_id: int):
     conn = sqlite3.connect("messenger.db")
     c = conn.cursor()
     
-    # Проверяем инвайт-код
-    c.execute("SELECT * FROM invites WHERE code = ? AND used = 0", (user.invite_code,))
-    invite = c.fetchone()
-    if not invite:
-        raise HTTPException(status_code=403, detail="Неверный код приглашения")
+    # Проверяем в pending
+    c.execute("SELECT status FROM pending_users WHERE id = ?", (user_id,))
+    row = c.fetchone()
+    if row:
+        conn.close()
+        return {"status": row[0]}
     
-    # Проверяем уникальность имени
-    c.execute("SELECT id FROM users WHERE name = ?", (user.name,))
-    if c.fetchone():
-        raise HTTPException(status_code=400, detail="Пользователь с таким именем уже существует")
+    # Проверяем в users (одобрен)
+    c.execute("SELECT id FROM users WHERE id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {"status": "approved"}
     
-    # Создаём пользователя
-    colors = ["#F44336", "#E91E63", "#9C27B0", "#673AB7", "#3F51B5", 
-              "#2196F3", "#009688", "#4CAF50", "#FF9800", "#795548"]
-    color = colors[len(user.name) % len(colors)]
+    return {"status": "unknown"}
+
+# Получить список заявок (для админа)
+@app.get("/api/pending")
+def get_pending():
+    conn = sqlite3.connect("messenger.db")
+    c = conn.cursor()
+    c.execute("SELECT id, first_name, last_name, status FROM pending_users WHERE status = 'pending'")
+    pending = [{"id": r[0], "first_name": r[1], "last_name": r[2]} for r in c.fetchall()]
+    conn.close()
+    return {"pending": pending}
+
+# Одобрить или отклонить
+@app.post("/api/approve")
+def approve(data: ApproveUser):
+    conn = sqlite3.connect("messenger.db")
+    c = conn.cursor()
     
-    c.execute("INSERT INTO users (name, avatar_color, invite_code) VALUES (?, ?, ?)",
-              (user.name, color, user.invite_code))
-    c.execute("UPDATE invites SET used = 1 WHERE code = ?", (user.invite_code,))
+    c.execute("SELECT * FROM pending_users WHERE id = ? AND status = 'pending'", (data.user_id,))
+    user = c.fetchone()
+    if not user:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Заявка не найдена")
+    
+    if data.approved:
+        c.execute("UPDATE pending_users SET status = 'approved' WHERE id = ?", (data.user_id,))
+        c.execute("INSERT INTO users (id, first_name, last_name) VALUES (?, ?, ?)",
+                  (user[0], user[1], user[2]))
+    else:
+        c.execute("UPDATE pending_users SET status = 'rejected' WHERE id = ?", (data.user_id,))
     
     conn.commit()
     conn.close()
-    return {"status": "ok", "avatar_color": color}
+    return {"status": "ok"}
 
+# Получить список пользователей
 @app.get("/api/users")
 def get_users():
     conn = sqlite3.connect("messenger.db")
     c = conn.cursor()
-    c.execute("SELECT name, avatar_color FROM users")
-    users = [{"name": r[0], "avatar_color": r[1]} for r in c.fetchall()]
+    c.execute("SELECT id, first_name, last_name, avatar_url FROM users")
+    users = [{"id": r[0], "first_name": r[1], "last_name": r[2], "avatar_url": r[3]} for r in c.fetchall()]
     conn.close()
     return {"users": users}
 
+# Создать чат
+@app.post("/api/create_chat")
+def create_chat(data: CreateChat):
+    chat_id = str(uuid.uuid4())[:8]
+    conn = sqlite3.connect("messenger.db")
+    c = conn.cursor()
+    c.execute("INSERT INTO chats (id, name, is_group) VALUES (?, ?, ?)",
+              (chat_id, data.name, 1 if len(data.user_ids) > 2 else 0))
+    for user_id in data.user_ids:
+        c.execute("INSERT OR IGNORE INTO chat_members (chat_id, user_id) VALUES (?, ?)",
+                  (chat_id, user_id))
+    conn.commit()
+    conn.close()
+    return {"chat_id": chat_id}
+
+# Получить чаты пользователя
+@app.get("/api/my_chats/{user_id}")
+def my_chats(user_id: int):
+    conn = sqlite3.connect("messenger.db")
+    c = conn.cursor()
+    c.execute("""SELECT c.id, c.name FROM chats c 
+                 JOIN chat_members cm ON c.id = cm.chat_id 
+                 WHERE cm.user_id = ?""", (user_id,))
+    chats = [{"id": r[0], "name": r[1]} for r in c.fetchall()]
+    conn.close()
+    return {"chats": chats}
+
+# Загрузить файл
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    ext = file.filename.split(".")[-1]
+    filename = f"{uuid.uuid4()}.{ext}"
+    filepath = os.path.join(UPLOAD_DIR, filename)
+    
+    with open(filepath, "wb") as f:
+        content = await file.read()
+        f.write(content)
+    
+    file_type = "image" if ext in ["jpg", "jpeg", "png", "gif"] else "video" if ext in ["mp4"] else "file"
+    return {"url": f"/uploads/{filename}", "type": file_type}
+
+# Получить сообщения
 @app.get("/api/messages/{chat_id}")
 def get_messages(chat_id: str, limit: int = 50):
     conn = sqlite3.connect("messenger.db")
     c = conn.cursor()
-    c.execute("SELECT sender, text, timestamp FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
+    c.execute("""SELECT sender_id, sender_name, text, file_url, file_type, timestamp 
+                 FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?""",
               (chat_id, limit))
-    messages = [{"sender": r[0], "text": r[1], "timestamp": r[2]} for r in c.fetchall()]
+    messages = [{"sender_id": r[0], "sender_name": r[1], "text": r[2], 
+                 "file_url": r[3], "file_type": r[4], "timestamp": r[5]} for r in c.fetchall()]
     conn.close()
     return {"messages": list(reversed(messages))}
 
-@app.post("/api/invite")
-def create_invite(name: str):
-    conn = sqlite3.connect("messenger.db")
-    c = conn.cursor()
-    code = hashlib.md5(str(datetime.datetime.now()).encode()).hexdigest()[:8].upper()
-    c.execute("INSERT INTO invites (code, created_by) VALUES (?, ?)", (code, name))
-    conn.commit()
-    conn.close()
-    return {"invite_code": code}
-
 # ========== WebSocket ==========
-@app.websocket("/ws/{username}")
-async def websocket_endpoint(websocket: WebSocket, username: str):
-    await manager.connect(username, websocket)
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: int):
+    await manager.connect(user_id, websocket)
     try:
         while True:
             data = await websocket.receive_json()
             
             if data["type"] == "message":
                 msg = {
-                    "sender": username,
+                    "type": "new_message",
                     "chat_id": data["chat_id"],
-                    "text": data["text"],
+                    "sender_id": user_id,
+                    "sender_name": data["sender_name"],
+                    "text": data.get("text", ""),
+                    "file_url": data.get("file_url"),
+                    "file_type": data.get("file_type"),
                     "timestamp": datetime.datetime.now().isoformat()
                 }
-                # Сохраняем в БД
+                
                 conn = sqlite3.connect("messenger.db")
                 c = conn.cursor()
-                c.execute("INSERT INTO messages (sender, chat_id, text, timestamp) VALUES (?, ?, ?, ?)",
-                         (msg["sender"], msg["chat_id"], msg["text"], msg["timestamp"]))
+                c.execute("""INSERT INTO messages (chat_id, sender_id, sender_name, text, file_url, file_type, timestamp) 
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                         (msg["chat_id"], user_id, msg["sender_name"], msg["text"], 
+                          msg["file_url"], msg["file_type"], msg["timestamp"]))
                 conn.commit()
                 conn.close()
                 
-                # Рассылаем
-                msg["type"] = "new_message"
-                await manager.broadcast_to_chat(msg, data["chat_id"])
-                
-            elif data["type"] == "typing":
-                await manager.broadcast_to_chat({
-                    "type": "typing",
-                    "user": username,
-                    "chat_id": data["chat_id"],
-                    "is_typing": data["is_typing"]
-                }, data["chat_id"], exclude=username)
+                await manager.broadcast_to_chat(msg, data["chat_id"], user_id)
                 
     except WebSocketDisconnect:
-        manager.disconnect(username)
-        await manager.broadcast_status()
-    except Exception as e:
-        print(f"Error: {e}")
-        manager.disconnect(username)
+        manager.disconnect(user_id)
         await manager.broadcast_status()
 
-# ========== СТАТИКА ==========
+# Раздача статики
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
 
 @app.get("/")
 def root():
     return FileResponse("static/index.html")
 
-# ========== ЗАПУСК ==========
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
